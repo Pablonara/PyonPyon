@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen3-rl"
+version = "0.1.0"
+description = "Multi-turn GRPO trainer for Qwen3.5"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.4.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "transformers",
+    "safetensors",
+    "huggingface_hub",
+]
+rl = [
+    "transformers>=4.50",
+    "peft>=0.14",
+    "accelerate",
+    "datasets",
+    "trl>=0.18,<0.25",
+]
+
+[tool.setuptools.packages.find]
+include = ["qwen3_rl*"]
