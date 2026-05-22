@@ -11,8 +11,11 @@ class RolloutConfig:
     gpu_memory_utilization: float = 0.35
     enable_lora: bool = True
     max_lora_rank: int = 64
-    enable_sleep_mode: bool = False
+    sleep_between_iters: bool = False
+    sleep_level: Literal[1, 2] = 1
+    enable_sleep_mode: bool = True
     language_model_only: bool = True
+    engine_version: Literal["v1"] = "v1"
     enable_prefix_caching: bool = True
     mamba_cache_mode: Literal["align", "all"] = "align"
     enforce_eager: bool = False
@@ -36,6 +39,10 @@ class GRPOConfig:
     epochs_per_batch: int = 1
     ratio_clamp: float = 20.0
     degenerate_std_threshold: float = 1e-6
+
+    def __post_init__(self) -> None:
+        if self.group_size < 2:
+            raise ValueError("GRPO group_size must be >= 2")
 
 
 @dataclass

@@ -3,6 +3,7 @@
 import torch
 import pytest
 
+from qwen3_rl.config import GRPOConfig
 from qwen3_rl.loss.grpo import grpo_loss, compute_group_advantages
 
 
@@ -29,6 +30,13 @@ class TestComputeGroupAdvantages:
         adv = compute_group_advantages([-1.0, 0.0, 1.0, 2.0])
         assert adv is not None
         assert adv[0] < 0 < adv[-1]
+
+
+class TestGRPOConfig:
+
+    def test_rejects_singleton_group_size(self):
+        with pytest.raises(ValueError, match="group_size"):
+            GRPOConfig(group_size=1)
 
 
 class TestGRPOLoss:

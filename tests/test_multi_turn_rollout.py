@@ -117,9 +117,7 @@ class MockEnv:
 
 
 def _make_tool_call_text() -> str:
-    """A valid tool call in Qwen3.5 format (without trailing </tool_call>
-    since the backend stop string cuts there, but including the tag for
-    the template parser to match)."""
+    """A valid tool call in Qwen3.5 format."""
     return (
         '</think>\n\n'
         '<tool_call>\n'
@@ -201,14 +199,22 @@ def test_tool_block_boundaries(tokenizer, cfg):
     assert QWEN3_5_SPEC.tool_resp_open.strip() in full_text
     assert QWEN3_5_SPEC.tool_resp_close.strip() in full_text
     assert QWEN3_5_SPEC.tool_block_close.strip() in full_text
+    assert (
+        "</tool_call>" + QWEN3_5_SPEC.assistant_close + QWEN3_5_SPEC.tool_block_open
+        in full_text
+    )
 
     # All tool boundary text is in prompt or env turns (mask=0)
+    assistant_close_turns = []
     for start, end, kind in traj.turns:
         if kind == "gen":
             continue
         seg = tokenizer.decode(traj.tokens[start:end].tolist())
+        if seg == QWEN3_5_SPEC.assistant_close:
+            assistant_close_turns.append((start, end))
         # These may contain boundary strings; mask should be 0
         assert not traj.mask[start:end].any()
+    assert assistant_close_turns
 
 
 def test_turn_types_present(tokenizer, cfg):
@@ -379,6 +385,64 @@ def test_multiple_tool_calls_in_one_turn(tokenizer, cfg):
     # All env turns should have mask=0
     for start, end, _ in env_turns:
         assert not traj.mask[start:end].any()
+
+
+def test_generated_assistant_close_for_tool_calls_is_trainable(tokenizer, cfg):
+    """If the model emits EOS after tool calls, only the trailing newline is masked out."""
+    double_call_text = (
+        '</think>\n\n'
+        '<tool_call>\n'
+        '<function=python>\n'
+        '<parameter=code>\n'
+        'print(1)\n'
+        '</parameter>\n'
+        '</function>\n'
+        '</tool_call>\n'
+        '<tool_call>\n'
+        '<function=python>\n'
+        '<parameter=code>\n'
+        'print(2)\n'
+        '</parameter>\n'
+        '</function>\n'
+        '</tool_call>'
+        '<|im_end|>'
+    )
+    double_call_ids = tokenizer.encode(double_call_text, add_special_tokens=False)
+    final_text = _make_final_answer_text()
+    final_ids = tokenizer.encode(final_text, add_special_tokens=False)
+
+    env = MockEnv(responses=[
+        (ToolResponse(content="1"), False),
+        (ToolResponse(content="2"), False),
+    ])
+    backend = MockBackend([
+        (double_call_ids, "eos"),
+        (final_ids, "eos"),
+    ])
+
+    rollout = MultiTurnRollout(env, QWEN3_5_SPEC, backend, tokenizer)
+    traj = rollout.run(cfg, seed_env=0, seed_rollout=0, rollout_id=0)
+
+    full_text = tokenizer.decode(traj.tokens.tolist())
+    assert (
+        "</tool_call>" + QWEN3_5_SPEC.assistant_close + QWEN3_5_SPEC.tool_block_open
+        in full_text
+    )
+
+    first_gen_idx = next(i for i, (_, _, kind) in enumerate(traj.turns) if kind == "gen")
+    gen_start, gen_end, _ = traj.turns[first_gen_idx]
+    assert tokenizer.decode(traj.tokens[gen_start:gen_end].tolist()).endswith(
+        QWEN3_5_SPEC.eos_token
+    )
+    assert traj.mask[gen_end - 1]
+
+    suffix_start, suffix_end, suffix_kind = traj.turns[first_gen_idx + 1]
+    assert suffix_kind == "prompt"
+    assert tokenizer.decode(traj.tokens[suffix_start:suffix_end].tolist()) == "\n"
+    assert not traj.mask[suffix_start:suffix_end].any()
+
+    env_turns = [(s, e, k) for s, e, k in traj.turns if k == "env"]
+    assert len(env_turns) == 2
 
 
 def test_two_turn_interaction(tokenizer, cfg):

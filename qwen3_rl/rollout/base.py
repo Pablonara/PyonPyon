@@ -23,6 +23,13 @@ def classify_truncation(out_tokens: list[int], tokenizer, template) -> dict:
     return {"truncated": True, "location": "answer", "last_open_tag": None}
 
 
+def _missing_assistant_close_suffix(text: str, assistant_close: str) -> str:
+    for n in range(len(assistant_close), 0, -1):
+        if text.endswith(assistant_close[:n]):
+            return assistant_close[n:]
+    return assistant_close
+
+
 class MultiTurnRollout:
 
     def __init__(self, env: Env, template: TemplateSpec, backend, tokenizer):
@@ -153,6 +160,11 @@ class MultiTurnRollout:
             if not calls:
                 break
 
+            close_suffix = _missing_assistant_close_suffix(
+                gen_text, self.template.assistant_close
+            )
+            if close_suffix:
+                builder.add_prompt(close_suffix)
             in_user_block = False
             for call in calls:
                 resp, done = self.env.step(call)

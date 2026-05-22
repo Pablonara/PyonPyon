@@ -97,7 +97,7 @@ def test_spec_boundary_strings():
     assert "<|im_start|>user" in spec.tool_block_open
     assert "<tool_response>" in spec.tool_resp_open
     assert "</tool_response>" in spec.tool_resp_close
-    assert "</tool_call>" in spec.stop_strings
+    assert spec.stop_strings == []
 
 
 def test_tool_call_with_think_block():

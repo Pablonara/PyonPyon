@@ -155,8 +155,11 @@ class MultiTurnGRPOTrainer:
             t0 = time.time()
 
             # ── 1. Rollout (no grad) ──
-            if self._is_vllm and iter_id > 0:
-                self.backend.sync_adapter(adapter_path, iter_id)
+            if self._is_vllm:
+                if cfg.rollout.sleep_between_iters:
+                    self.backend.wake()
+                if iter_id > 0:
+                    self.backend.sync_adapter(adapter_path, iter_id)
 
             self.model.eval()
             all_trajs: list[Trajectory] = []
@@ -210,6 +213,10 @@ class MultiTurnGRPOTrainer:
                         all_trajs.append(traj.replace(advantage=adv))
 
             t_rollout = time.time() - t0
+
+            # ── Sleep vLLM before training-side forwards ──
+            if self._is_vllm and cfg.rollout.sleep_between_iters:
+                self.backend.sleep()
 
             # ── 3-4: Training (only if non-degenerate trajectories exist) ──
             t_logp = 0.0

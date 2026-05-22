@@ -26,17 +26,21 @@ def _patch_vllm_decompose_size_nodes() -> None:
     import torch
     import torch.fx as fx
 
-    def _fixed(graph: fx.GraphModule) -> None:
+    def _fixed_decompose_size_nodes(graph: fx.GraphModule) -> None:
         size_nodes = list(
             graph.graph.find_nodes(op="call_method", target="size")
         )
         for node in size_nodes:
+            # x.size(dim) returns a scalar SymInt -- nothing to decompose.
             if len(node.args) > 1:
                 continue
 
             tensor_node = node.args[0]
             ev = tensor_node.meta.get("example_value")
-            assert ev is not None
+            assert ev is not None, (
+                f"Tensor node '{tensor_node.name}' has no example_value "
+                f"metadata. Cannot decompose size node '{node.name}'."
+            )
 
             dims: list[fx.Node | int] = []
             with graph.graph.inserting_after(tensor_node):
@@ -51,6 +55,12 @@ def _patch_vllm_decompose_size_nodes() -> None:
                         dims.append(dn)
                     elif isinstance(dim_val, int):
                         dims.append(dim_val)
+                    else:
+                        raise AssertionError(
+                            f"dim_val is either torch.SymInt or int, "
+                            f"got {type(dim_val)} for dim {i} of "
+                            f"'{node.name}'"
+                        )
 
             for user in list(node.users):
                 if (
@@ -60,6 +70,10 @@ def _patch_vllm_decompose_size_nodes() -> None:
                     and user.args[0] is node
                 ):
                     idx = user.args[1]
+                    assert isinstance(idx, int), (
+                        f"Expected literal int index for getitem on size(), "
+                        f"got {type(idx).__name__}: {idx}"
+                    )
                     user.replace_all_uses_with(dims[idx])
                     graph.graph.erase_node(user)
                 else:
@@ -72,7 +86,7 @@ def _patch_vllm_decompose_size_nodes() -> None:
                     user.args = tuple(new_args)
             graph.graph.erase_node(node)
 
-    _backends._decompose_size_nodes = _fixed
+    _backends._decompose_size_nodes = _fixed_decompose_size_nodes
 
 
 def _ensure_cuda_home() -> None:
@@ -194,6 +208,7 @@ class VLLMBackend:
         self._LoRARequest = LoRARequest
         self.config = config
         self._current_lora: LoRARequest | None = None
+        self._prev_adapter_name: str | None = None
         self._stop_warned: bool = False
 
         engine_kwargs: dict = dict(
@@ -304,6 +319,27 @@ class VLLMBackend:
         return results
 
     # ------------------------------------------------------------------
+    # Sleep / wake lifecycle
+    # ------------------------------------------------------------------
+
+    def sleep(self) -> None:
+        """Offload KV cache to CPU and free GPU memory for training.
+
+        With unsloth's patched CuMemAllocator, weight tensors are skipped
+        (they're shared with the HF model). Only KV cache is offloaded.
+        """
+        self.llm.sleep(level=self.config.sleep_level)
+
+    def wake(self) -> None:
+        """Restore KV cache from CPU to GPU before rollout.
+
+        Must NOT pass ``tags=["weights"]`` — that leaves the executor's
+        ``is_sleeping`` flag True, causing a redundant wake inside
+        ``generate()`` which double-maps already-mapped handles.
+        """
+        self.llm.wake_up()
+
+    # ------------------------------------------------------------------
     # LoRA adapter sync
     # ------------------------------------------------------------------
 
@@ -312,3 +348,4 @@ class VLLMBackend:
         lora_req = self._LoRARequest(new_name, 1, lora_path)
         self.llm.llm_engine.add_lora(lora_req)
         self._current_lora = lora_req
+        self._prev_adapter_name = new_name

@@ -53,7 +53,7 @@ QWEN3_5_SPEC = TemplateSpec(
     tool_resp_between="",
     tool_block_close="<|im_end|>\n",
     eos_token="<|im_end|>",
-    stop_strings=["</tool_call>"],
+    stop_strings=[],
     parse_tool_calls=parse_tool_calls,
     format_tool_response=format_tool_response,
 )
