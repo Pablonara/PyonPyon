@@ -12,6 +12,7 @@ from .loss.fused_logp import compute_per_token_logp, _chunked_logp
 from .loss.grpo import compute_group_advantages, grpo_loss
 from .rollout.base import MultiTurnRollout
 from .rollout.hf_backend import HFBackend
+from .trace import RolloutTraceRecorder
 from .trajectory import Trajectory, require
 
 if TYPE_CHECKING:
@@ -111,6 +112,14 @@ class MultiTurnGRPOTrainer:
         else:
             self.scheduler = None
 
+        self.trace_recorder = RolloutTraceRecorder(
+            config.rollout_trace_dir,
+            tokenizer,
+            template,
+            run_id=f"seed{config.seed_torch}_{int(time.time())}",
+            max_queue=config.rollout_trace_queue_size,
+        )
+
     @torch.no_grad()
     def _eval(self, n_problems: int = 32) -> float:
         self.model.eval()
@@ -135,6 +144,32 @@ class MultiTurnGRPOTrainer:
                 correct += traj.reward
         return correct / n_problems
 
+    def _record_rollout_trace(
+        self,
+        traj: Trajectory,
+        *,
+        iter_id: int,
+        group_id: int,
+        rollout_id: int,
+        seed_env: int,
+    ) -> None:
+        cfg = self.config
+        if cfg.rollout_trace_dir is None:
+            return
+        if cfg.rollout_trace_every <= 0:
+            return
+        if iter_id % cfg.rollout_trace_every != 0:
+            return
+
+        self.trace_recorder.record(
+            traj,
+            iter_id=iter_id,
+            group_id=group_id,
+            rollout_id=rollout_id,
+            seed_env=seed_env,
+            seed_rollout=cfg.seed_rollout + rollout_id * cfg.rollout.max_turns,
+        )
+
     def train(self, num_iterations: int):
         cfg = self.config
         G = cfg.grpo.group_size
@@ -147,6 +182,7 @@ class MultiTurnGRPOTrainer:
 
         degenerate_count = 0
         reward_history: list[float] = []
+        adapter_saved = False
 
         eval_acc = self._eval(n_problems=cfg.eval_subset_size)
         print(f"[eval  init] accuracy={eval_acc:.3f} ({cfg.eval_subset_size} problems)")
@@ -158,7 +194,7 @@ class MultiTurnGRPOTrainer:
             if self._is_vllm:
                 if cfg.rollout.sleep_between_iters:
                     self.backend.wake()
-                if iter_id > 0:
+                if iter_id > 0 and adapter_saved:
                     self.backend.sync_adapter(adapter_path, iter_id)
 
             self.model.eval()
@@ -195,12 +231,20 @@ class MultiTurnGRPOTrainer:
                             group_trajs.append(traj)
                     all_groups.append(group_trajs)
 
-            for group_trajs in all_groups:
+            trace_enabled = (
+                cfg.rollout_trace_dir is not None
+                and cfg.rollout_trace_every > 0
+                and iter_id % cfg.rollout_trace_every == 0
+            )
+            trace_budget = cfg.rollout_trace_max_per_iter
+            trace_count = 0
+            for group_id, group_trajs in enumerate(all_groups):
                 # ── 2. Group normalization ──
                 rewards = [t.reward for t in group_trajs]
                 advantages = compute_group_advantages(
                     rewards, threshold=cfg.grpo.degenerate_std_threshold
                 )
+                trace_trajs = group_trajs
                 if advantages is None:
                     degenerate_count += 1
                     if cfg.log_every and iter_id % cfg.log_every == 0:
@@ -208,9 +252,25 @@ class MultiTurnGRPOTrainer:
                             f"[iter {iter_id:4d}] degenerate group "
                             f"(all rewards={rewards[0]:.3f}), skipping"
                         )
+                    trace_trajs = []
                 else:
                     for traj, adv in zip(group_trajs, advantages):
-                        all_trajs.append(traj.replace(advantage=adv))
+                        traj = traj.replace(advantage=adv)
+                        all_trajs.append(traj)
+                        trace_trajs.append(traj)
+
+                if trace_enabled and (trace_budget == 0 or trace_count < trace_budget):
+                    for rollout_id, traj in enumerate(trace_trajs):
+                        if trace_budget > 0 and trace_count >= trace_budget:
+                            break
+                        self._record_rollout_trace(
+                            traj,
+                            iter_id=iter_id,
+                            group_id=group_id,
+                            rollout_id=rollout_id,
+                            seed_env=seed_envs[group_id],
+                        )
+                        trace_count += 1
 
             t_rollout = time.time() - t0
 
@@ -288,6 +348,7 @@ class MultiTurnGRPOTrainer:
                     os.makedirs(adapter_path, exist_ok=True)
                     self.model.save_pretrained(adapter_path)
                     self.tokenizer.save_pretrained(adapter_path)
+                    adapter_saved = True
 
             elapsed = time.time() - t0
 
@@ -315,6 +376,23 @@ class MultiTurnGRPOTrainer:
                     f"t={elapsed:.1f}s "
                     f"(roll={t_rollout:.1f} logp={t_logp:.1f} train={t_train:.1f})"
                 )
+            elif cfg.log_every and iter_id % cfg.log_every == 0:
+                rewards_iter = [
+                    t.reward for group_trajs in all_groups for t in group_trajs
+                    if t.reward is not None
+                ]
+                iter_reward = (
+                    sum(rewards_iter) / len(rewards_iter)
+                    if rewards_iter else float("nan")
+                )
+                print(
+                    f"[iter {iter_id:4d}] "
+                    f"no non-degenerate groups  "
+                    f"reward={iter_reward:.3f} "
+                    f"n=0/{sum(len(group_trajs) for group_trajs in all_groups)}  "
+                    f"t={elapsed:.1f}s "
+                    f"(roll={t_rollout:.1f} logp={t_logp:.1f} train={t_train:.1f})"
+                )
 
             # ── 6. Periodic eval (runs even on degenerate iterations) ──
             if cfg.eval_every and (iter_id + 1) % cfg.eval_every == 0:
@@ -329,3 +407,8 @@ class MultiTurnGRPOTrainer:
                 print(f"  -> saved to {save_path}")
 
         print(f"\nDone. {degenerate_count} degenerate groups skipped.")
+        self.trace_recorder.close()
+        if self.trace_recorder.dropped:
+            print(f"Rollout trace recorder dropped {self.trace_recorder.dropped} item(s).")
+        if self.trace_recorder.errors:
+            print(f"Rollout trace recorder failed to write {self.trace_recorder.errors} item(s).")

@@ -30,6 +30,22 @@ def _missing_assistant_close_suffix(text: str, assistant_close: str) -> str:
     return assistant_close
 
 
+def _env_metadata(env: "Env") -> dict:
+    metadata = getattr(env, "last_metadata", None)
+    if isinstance(metadata, dict):
+        return dict(metadata)
+    return {}
+
+
+def _with_reward_metadata(env: "Env", traj: "Trajectory", reward: float) -> "Trajectory":
+    metadata = getattr(env, "last_reward_metadata", None)
+    if not isinstance(metadata, dict):
+        return dataclasses.replace(traj, reward=reward)
+    meta = dict(traj.meta)
+    meta["reward"] = dict(metadata)
+    return dataclasses.replace(traj, reward=reward, meta=meta)
+
+
 class MultiTurnRollout:
 
     def __init__(self, env: Env, template: TemplateSpec, backend, tokenizer):
@@ -52,6 +68,7 @@ class MultiTurnRollout:
 
         for seed_env in seed_envs:
             messages = self.env.reset(seed=seed_env)
+            env_metadata = _env_metadata(self.env)
             prompt_text = self.tokenizer.apply_chat_template(
                 messages, tools=self.env.tools or None,
                 add_generation_prompt=False, tokenize=False,
@@ -59,6 +76,7 @@ class MultiTurnRollout:
 
             for rollout_id in range(group_size):
                 b = TrajectoryBuilder(self.tokenizer)
+                b.meta.update(env_metadata)
                 b.add_prompt(prompt_text)
                 b.add_prompt(self.template.assistant_open)
                 all_builders.append(b)
@@ -100,9 +118,9 @@ class MultiTurnRollout:
                     gen_start = seq_len - len(out_tokens)
                     logp_old[gen_start:] = torch.tensor(gen_logprobs, dtype=torch.float32)
 
-                traj = dataclasses.replace(
-                    traj, reward=self.env.reward(traj), logp_old=logp_old,
-                )
+                reward = self.env.reward(traj)
+                traj = _with_reward_metadata(self.env, traj, reward)
+                traj = dataclasses.replace(traj, logp_old=logp_old)
                 group_trajs.append(traj)
                 idx += 1
             groups.append(group_trajs)
@@ -119,6 +137,7 @@ class MultiTurnRollout:
         messages = self.env.reset(seed=seed_env)
 
         builder = TrajectoryBuilder(self.tokenizer)
+        builder.meta.update(_env_metadata(self.env))
         prompt_text = self.tokenizer.apply_chat_template(
             messages,
             tools=self.env.tools or None,
@@ -193,4 +212,5 @@ class MultiTurnRollout:
             }
 
         traj = builder.freeze()
-        return dataclasses.replace(traj, reward=self.env.reward(traj))
+        reward = self.env.reward(traj)
+        return _with_reward_metadata(self.env, traj, reward)

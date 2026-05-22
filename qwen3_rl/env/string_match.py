@@ -13,6 +13,7 @@ from __future__ import annotations
 import random
 import re
 
+from .reward_text import strip_think_blocks
 from .types import Message, ToolCall, ToolResponse
 
 
@@ -44,8 +45,7 @@ def _make_problem(rng: random.Random, difficulty: str = "mixed") -> tuple[str, i
 
 def _extract_number(text: str) -> int | None:
     """Extract the last integer from model output."""
-    # strip think blocks
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = strip_think_blocks(text)
     # find all integers (including negative)
     numbers = re.findall(r"-?\d+", text)
     if not numbers:

@@ -27,6 +27,8 @@ def main():
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--max-seq-len", type=int, default=2048)
     parser.add_argument("--group-size", type=int, default=4)
+    parser.add_argument("--num-generations", type=int, default=None,
+                        help="Alias for --group-size; number of rollouts per prompt")
     parser.add_argument("--num-iters", type=int, default=50)
     parser.add_argument("--max-turns", type=int, default=1)
     parser.add_argument("--max-tokens-per-turn", type=int, default=512)
@@ -40,7 +42,37 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--enforce-eager", action="store_true",
                         help="Disable torch.compile + CUDA graphs in vLLM (for debugging)")
+    parser.add_argument("--reverse-min-len", type=int, default=4,
+                        help="Minimum easy reverse-string length")
+    parser.add_argument("--reverse-max-len", type=int, default=8,
+                        help="Maximum easy reverse-string length")
+    parser.add_argument("--reverse-hard-min-len", type=int, default=None,
+                        help="Minimum hard reverse-string length")
+    parser.add_argument("--reverse-hard-max-len", type=int, default=None,
+                        help="Maximum hard reverse-string length")
+    parser.add_argument("--reverse-hard-prob", type=float, default=0.0,
+                        help="Probability of sampling a hard reverse-string problem")
+    parser.add_argument("--reverse-correct-think-bonus", type=float, default=0.0,
+                        help="Max reward bonus for longer thinking on correct reverse answers")
+    parser.add_argument("--reverse-think-bonus-cap-tokens", type=int, default=1024,
+                        help="Think-token cap used to normalize the correct-answer bonus")
+    parser.add_argument("--reverse-wrong-length-penalty", type=float, default=0.0,
+                        help="Max reward penalty for long wrong reverse answers")
+    parser.add_argument("--reverse-wrong-length-cap-tokens", type=int, default=4096,
+                        help="Generated-token cap used to normalize the wrong-answer penalty")
+    parser.add_argument("--rollout-trace-dir", default=None,
+                        help="Optional directory for non-blocking rollout trace JSONL logs")
+    parser.add_argument("--rollout-trace-every", type=int, default=1,
+                        help="Trace every N training iterations when rollout tracing is enabled")
+    parser.add_argument("--rollout-trace-max-per-iter", type=int, default=8,
+                        help="Max rollout traces per traced iteration; 0 means unlimited")
+    parser.add_argument("--rollout-trace-queue-size", type=int, default=1024,
+                        help="Best-effort trace writer queue size; full queues drop traces")
     args = parser.parse_args()
+
+    num_generations = (
+        args.num_generations if args.num_generations is not None else args.group_size
+    )
 
     print(f"Loading {args.model}...")
     model, tokenizer = FastModel.from_pretrained(
@@ -84,7 +116,7 @@ def main():
             enforce_eager=args.enforce_eager,
         ),
         grpo=GRPOConfig(
-            group_size=args.group_size,
+            group_size=num_generations,
             prompts_per_iter=args.prompts_per_iter,
         ),
         model_name=args.model,
@@ -96,12 +128,27 @@ def main():
         seed_torch=args.seed,
         seed_rollout=args.seed,
         seed_env=args.seed,
+        rollout_trace_dir=args.rollout_trace_dir,
+        rollout_trace_every=args.rollout_trace_every,
+        rollout_trace_max_per_iter=args.rollout_trace_max_per_iter,
+        rollout_trace_queue_size=args.rollout_trace_queue_size,
     )
 
     # Create environment
     if args.env == "reverse_string":
         from qwen3_rl.env.reverse_string import ReverseStringEnv
-        env = ReverseStringEnv(tokenizer)
+        env = ReverseStringEnv(
+            tokenizer,
+            min_len=args.reverse_min_len,
+            max_len=args.reverse_max_len,
+            hard_min_len=args.reverse_hard_min_len,
+            hard_max_len=args.reverse_hard_max_len,
+            hard_prob=args.reverse_hard_prob,
+            correct_think_bonus=args.reverse_correct_think_bonus,
+            think_bonus_cap_tokens=args.reverse_think_bonus_cap_tokens,
+            wrong_length_penalty=args.reverse_wrong_length_penalty,
+            wrong_length_cap_tokens=args.reverse_wrong_length_cap_tokens,
+        )
     else:
         from qwen3_rl.env.string_match import StringMatchEnv
         env = StringMatchEnv(tokenizer)
@@ -116,10 +163,32 @@ def main():
         model, tokenizer, env, QWEN3_5_SPEC, config, backend=backend,
     )
 
-    print(f"\nStarting GRPO training: {args.num_iters} iterations, M={args.prompts_per_iter}, G={args.group_size}")
+    print(
+        f"\nStarting GRPO training: {args.num_iters} iterations, "
+        f"M={args.prompts_per_iter}, num_generations={num_generations}"
+    )
     print(f"  model={args.model}, lora_r={args.lora_r}, lr={args.lr}, seed={args.seed}")
     print(f"  max_turns={args.max_turns}, max_tokens_per_turn={args.max_tokens_per_turn}")
     print(f"  env={args.env}, backend={args.backend}")
+    if args.env == "reverse_string":
+        print(
+            "  reverse_lengths="
+            f"easy[{args.reverse_min_len},{args.reverse_max_len}] "
+            f"hard[{args.reverse_hard_min_len},{args.reverse_hard_max_len}] "
+            f"p_hard={args.reverse_hard_prob}"
+        )
+        print(
+            "  reverse_reward_shaping="
+            f"correct_think_bonus={args.reverse_correct_think_bonus} "
+            f"think_cap={args.reverse_think_bonus_cap_tokens} "
+            f"wrong_length_penalty={args.reverse_wrong_length_penalty} "
+            f"wrong_cap={args.reverse_wrong_length_cap_tokens}"
+        )
+    if args.rollout_trace_dir:
+        print(
+            f"  rollout_traces={args.rollout_trace_dir} "
+            f"(every={args.rollout_trace_every}, max_per_iter={args.rollout_trace_max_per_iter})"
+        )
     print()
 
     trainer.train(num_iterations=args.num_iters)

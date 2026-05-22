@@ -65,3 +65,7 @@ class RunConfig:
     seed_torch: int = 42
     seed_rollout: int = 42
     seed_env: int = 42
+    rollout_trace_dir: str | None = None
+    rollout_trace_every: int = 1
+    rollout_trace_max_per_iter: int = 8
+    rollout_trace_queue_size: int = 1024

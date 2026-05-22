@@ -1,8 +1,19 @@
-"""vLLM backend for batched rollout generation with torch.compile + CUDA graphs."""
+"""vLLM backend for fast rollout generation with sleep/wake lifecycle.
+
+Wraps vLLM's offline LLM engine with:
+- V1 engine in single-process mode (no EngineCore subprocess)
+- Sleep/wake lifecycle with unsloth's CuMemAllocator patch (skips weights)
+- LoRA adapter sync with stale-cache workaround (vLLM #42125)
+- Prefix caching with mamba_cache_mode="align" for DeltaNet hybrid
+
+Requires vLLM >= 0.20.0 and unsloth.  Import is lazy so the rest of
+qwen3_rl works without vLLM installed.
+"""
 
 from __future__ import annotations
 
 import os
+import sys
 import warnings
 from typing import TYPE_CHECKING
 
@@ -30,6 +41,7 @@ def _patch_vllm_decompose_size_nodes() -> None:
         size_nodes = list(
             graph.graph.find_nodes(op="call_method", target="size")
         )
+
         for node in size_nodes:
             # x.size(dim) returns a scalar SymInt -- nothing to decompose.
             if len(node.args) > 1:
@@ -89,33 +101,74 @@ def _patch_vllm_decompose_size_nodes() -> None:
     _backends._decompose_size_nodes = _fixed_decompose_size_nodes
 
 
-def _ensure_cuda_home() -> None:
-    """Set CUDA_HOME to pip-installed nvcc 13+ if system nvcc is too old for SM120."""
-    if "CUDA_HOME" in os.environ:
+def _prepend_path(env_key: str, path: str) -> None:
+    if not path or not os.path.isdir(path):
         return
+    existing = os.environ.get(env_key, "")
+    parts = [p for p in existing.split(os.pathsep) if p]
+    if path not in parts:
+        os.environ[env_key] = os.pathsep.join([path] + parts)
+
+
+def _has_nvcc(cuda_home: str | None) -> bool:
+    return bool(cuda_home) and os.path.isfile(os.path.join(cuda_home, "bin", "nvcc"))
+
+
+def _find_pip_cuda_home() -> str | None:
     try:
         import importlib.util
         spec = importlib.util.find_spec("nvidia.cuda_nvcc")
         if spec is None or spec.submodule_search_locations is None:
-            return
-        nvcc_pkg = list(spec.submodule_search_locations)[0]
-        cu13_root = os.path.normpath(os.path.join(nvcc_pkg, "..", "..", "cu13"))
-        if not os.path.isfile(os.path.join(cu13_root, "bin", "nvcc")):
-            return
-        os.environ["CUDA_HOME"] = cu13_root
-        lib_dir = os.path.join(cu13_root, "lib")
-        if os.path.isdir(lib_dir):
-            existing = os.environ.get("LD_LIBRARY_PATH", "")
-            if lib_dir not in existing:
-                os.environ["LD_LIBRARY_PATH"] = (
-                    f"{lib_dir}:{existing}" if existing else lib_dir
-                )
+            import site
+            cu13_roots = [
+                os.path.join(root, "nvidia", "cu13")
+                for root in site.getsitepackages() + [site.getusersitepackages()]
+            ]
+            cu13_root = next(
+                (
+                    root for root in cu13_roots
+                    if os.path.isfile(os.path.join(root, "bin", "nvcc"))
+                ),
+                None,
+            )
+            return cu13_root
+        else:
+            nvcc_pkg = list(spec.submodule_search_locations)[0]
+            cu13_root = os.path.normpath(os.path.join(nvcc_pkg, "..", "..", "cu13"))
+            nvcc_bin = os.path.join(cu13_root, "bin", "nvcc")
+            if not os.path.isfile(nvcc_bin):
+                return None
+            return cu13_root
     except Exception:
-        pass
+        return None
+
+
+def _ensure_cuda_home() -> None:
+    """Set CUDA_HOME/PATH to a CUDA 13 toolkit that can JIT SM120 kernels."""
+    cuda_home = os.environ.get("CUDA_HOME")
+    if not _has_nvcc(cuda_home):
+        cuda_home = _find_pip_cuda_home()
+        if cuda_home is None:
+            return
+        os.environ["CUDA_HOME"] = cuda_home
+
+    _prepend_path("PATH", os.path.join(sys.prefix, "bin"))
+    _prepend_path("PATH", os.path.join(cuda_home, "bin"))
+    _prepend_path("LD_LIBRARY_PATH", os.path.join(cuda_home, "lib"))
 
 
 def _ensure_cudart_path() -> None:
-    """Patch find_loaded_library to skip tilelang's libcudart_stub.so."""
+    """Point vLLM at the real libcudart, not tilelang's stub.
+
+    Unsloth's import chain loads tilelang which puts a minimal
+    ``libcudart_stub.so`` into the process address space.  vLLM's
+    ``CudaRTLibrary`` uses ``find_loaded_library("libcudart")`` which
+    then returns the stub, causing ``cudaDeviceReset`` AttributeError.
+
+    We patch the function reference in both ``system_utils`` (the
+    source) and ``cuda_wrapper`` (which imports it at module level)
+    to skip any path containing ``_stub.so``.
+    """
     real_cudart = None
     try:
         import nvidia.cuda_runtime
@@ -128,9 +181,35 @@ def _ensure_cudart_path() -> None:
                 break
     except ImportError:
         pass
+
+    if real_cudart is None:
+        try:
+            import site
+            candidates = []
+            for root in site.getsitepackages() + [site.getusersitepackages()]:
+                candidates.extend([
+                    os.path.join(root, "nvidia", "cu13", "lib", "libcudart.so.13"),
+                    os.path.join(root, "nvidia", "cu13", "lib", "libcudart.so"),
+                    os.path.join(root, "nvidia", "cu12", "lib", "libcudart.so.12"),
+                    os.path.join(root, "nvidia", "cu12", "lib", "libcudart.so"),
+                ])
+            for path in candidates:
+                if os.path.isfile(path):
+                    real_cudart = path
+                    os.environ["VLLM_CUDART_SO_PATH"] = path
+                    break
+        except Exception:
+            pass
+
     if real_cudart is None:
         return
 
+    # Force-load the real libcudart with RTLD_GLOBAL so it appears
+    # BEFORE tilelang's stub in /proc/self/maps.  vLLM's
+    # find_loaded_library scans maps top-to-bottom and returns the
+    # first match; ctypes.CDLL with RTLD_GLOBAL puts our library at
+    # a higher address (later in maps), but we can also just patch
+    # the function to skip stubs.
     import ctypes
     ctypes.CDLL(real_cudart, mode=ctypes.RTLD_GLOBAL)
 
@@ -145,6 +224,9 @@ def _ensure_cudart_path() -> None:
             return result
 
         _su.find_loaded_library = _find_no_stubs
+
+        # cuda_wrapper imports find_loaded_library at module level,
+        # so we must also patch it there once it's loaded.
         import vllm.distributed.device_communicators.cuda_wrapper as _cw
         _cw.find_loaded_library = _find_no_stubs
     except (ImportError, AttributeError):
@@ -152,13 +234,21 @@ def _ensure_cudart_path() -> None:
 
 
 def _pre_import_env(config: RolloutConfig) -> None:
-    """Set env vars that must exist before ``import vllm``."""
+    """Set all env vars that must exist BEFORE ``import vllm``."""
     _ensure_cuda_home()
     _ensure_cudart_path()
+
+    # Disable V1 EngineCore subprocess — it corrupts Triton CUDA state
+    # in the parent process, causing CUDA_ERROR_MISALIGNED_ADDRESS during
+    # FLA DeltaNet backward.  Unsloth uses the same fix.
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+
     os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
+    os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
+
     if config.language_model_only:
         os.environ["VLLM_LANGUAGE_MODEL_ONLY"] = "1"
+
     if config.enable_sleep_mode:
         os.environ["UNSLOTH_VLLM_STANDBY"] = "1"
 
@@ -183,7 +273,14 @@ class VLLMBackend:
     ):
         _pre_import_env(config)
 
-        # Selective unsloth patches — skip LoRA manager (missing methods in 0.21+)
+        # Unsloth's patch_vllm() must run before LLM is instantiated.
+        # It patches CuMemAllocator.sleep/wake_up to skip weight tensors
+        # (weights are shared with the HF model, not owned by vLLM).
+        # We selectively apply only the patches we need: sleep mode +
+        # inductor config.  We skip LoRA manager patching because unsloth's
+        # replacement class is missing methods that vLLM 0.21+ expects
+        # (e.g. get_dummy_lora_warmup_rank), and we handle LoRA sync
+        # ourselves via load_lora_adapter().
         from unsloth_zoo.vllm_utils import (
             patch_vllm_set_inductor_config,
             patch_vllm_enable_sleep_mode,
@@ -194,10 +291,13 @@ class VLLMBackend:
             patch_vllm_enable_sleep_mode()
         patch_vllm_graph_capture()
 
+        # Fix torch.compile crash in _decompose_size_nodes for hybrid
+        # DeltaNet/GQA models (Qwen3.5). Must run before LLM instantiation.
         if not config.enforce_eager:
             _patch_vllm_decompose_size_nodes()
 
-        from vllm import LLM, SamplingParams, TokensPrompt
+        from vllm import LLM, SamplingParams
+        from vllm import TokensPrompt
         try:
             from vllm import LoRARequest
         except ImportError:
@@ -207,10 +307,14 @@ class VLLMBackend:
         self._TokensPrompt = TokensPrompt
         self._LoRARequest = LoRARequest
         self.config = config
+
+        # LoRA adapter tracking for stale-cache workaround
         self._current_lora: LoRARequest | None = None
         self._prev_adapter_name: str | None = None
+
         self._stop_warned: bool = False
 
+        # Build engine kwargs
         engine_kwargs: dict = dict(
             model=model_name,
             dtype="bfloat16",
@@ -223,6 +327,8 @@ class VLLMBackend:
             enable_sleep_mode=config.enable_sleep_mode,
             hf_overrides={"mamba_cache_mode": config.mamba_cache_mode},
         )
+
+        # Quantization
         if config.quantization == "fp8":
             engine_kwargs["quantization"] = "fp8"
         elif config.quantization == "nf4":
@@ -231,6 +337,7 @@ class VLLMBackend:
 
         self.llm = LLM(**engine_kwargs)
 
+        # If an initial LoRA path is provided, load it as adapter_v0
         if lora_path is not None:
             self.sync_adapter(lora_path, iter_id=0)
 
@@ -246,6 +353,11 @@ class VLLMBackend:
         stop: list[str],
         seed: int,
     ) -> tuple[list[int], str]:
+        """Generate tokens from a token-id prefix.
+
+        Returns (new_token_ids, finish_reason) where finish_reason is one
+        of "eos", "length", "stop".
+        """
         sampling = self._SamplingParams(
             max_tokens=max_new,
             temperature=self.config.temperature,
@@ -254,12 +366,17 @@ class VLLMBackend:
             stop=stop if stop else None,
             seed=seed,
         )
-        output = self.llm.generate(
-            [self._TokensPrompt(prompt_token_ids=token_ids)],
+        prompt = self._TokensPrompt(prompt_token_ids=token_ids)
+
+        outputs = self.llm.generate(
+            [prompt],
             sampling_params=sampling,
             lora_request=self._current_lora,
-        )[0].outputs[0]
+        )
+        output = outputs[0].outputs[0]
 
+        # Token output is authoritative (design invariant: never decode
+        # then re-encode).
         gen_ids = list(output.token_ids)
         finish = _classify_finish(output.finish_reason, gen_ids, stop_token_ids)
 
@@ -281,11 +398,15 @@ class VLLMBackend:
         seeds: list[int],
         return_logprobs: bool = False,
     ) -> list[tuple[list[int], str, list[float] | None]]:
-        """Generate from multiple prompts in one vLLM batch.
+        """Generate from multiple prompts in a single vLLM batch.
 
         Returns list of (token_ids, finish_reason, logprobs_or_None).
+        When ``return_logprobs=True``, each generated token's logprob is
+        returned as a float list aligned with token_ids.
         """
-        prompts = [self._TokensPrompt(prompt_token_ids=ids) for ids in token_ids_list]
+        prompts = [
+            self._TokensPrompt(prompt_token_ids=ids) for ids in token_ids_list
+        ]
         sampling_list = [
             self._SamplingParams(
                 max_tokens=max_new,
@@ -300,7 +421,9 @@ class VLLMBackend:
         ]
 
         outputs = self.llm.generate(
-            prompts, sampling_params=sampling_list, lora_request=self._current_lora,
+            prompts,
+            sampling_params=sampling_list,
+            lora_request=self._current_lora,
         )
 
         results = []
@@ -311,10 +434,14 @@ class VLLMBackend:
 
             logprobs = None
             if return_logprobs and output.logprobs:
-                logprobs = [
-                    next(iter(lp.values())).logprob if lp else 0.0
-                    for lp in output.logprobs
-                ]
+                logprobs = []
+                for lp_dict in output.logprobs:
+                    if lp_dict:
+                        top = next(iter(lp_dict.values()))
+                        logprobs.append(top.logprob)
+                    else:
+                        logprobs.append(0.0)
+
             results.append((gen_ids, finish, logprobs))
         return results
 
@@ -326,7 +453,7 @@ class VLLMBackend:
         """Offload KV cache to CPU and free GPU memory for training.
 
         With unsloth's patched CuMemAllocator, weight tensors are skipped
-        (they're shared with the HF model). Only KV cache is offloaded.
+        (they're shared with the HF model).  Only KV cache is offloaded.
         """
         self.llm.sleep(level=self.config.sleep_level)
 
@@ -344,6 +471,10 @@ class VLLMBackend:
     # ------------------------------------------------------------------
 
     def sync_adapter(self, lora_path: str, iter_id: int) -> None:
+        """Load a new LoRA adapter checkpoint via the engine's add_lora API.
+
+        Uses a unique name per iteration (``adapter_v{iter_id}``).
+        """
         new_name = f"adapter_v{iter_id}"
         lora_req = self._LoRARequest(new_name, 1, lora_path)
         self.llm.llm_engine.add_lora(lora_req)
