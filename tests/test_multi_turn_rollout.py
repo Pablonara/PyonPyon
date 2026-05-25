@@ -6,6 +6,7 @@ tool calls. Verifies mask patterns, turn boundaries, and truncation.
 
 from __future__ import annotations
 
+import asyncio
 import pytest
 import torch
 from typing import Optional
@@ -13,6 +14,7 @@ from unittest.mock import MagicMock
 
 from qwen3_rl.config import RolloutConfig
 from qwen3_rl.env.types import Message, ToolCall, ToolResponse
+from qwen3_rl.rollout.async_pool import AsyncRolloutPool
 from qwen3_rl.rollout.base import MultiTurnRollout
 from qwen3_rl.template.qwen3_5 import QWEN3_5_SPEC
 from qwen3_rl.trajectory import Trajectory
@@ -28,13 +30,50 @@ class MockBackend:
     def __init__(self, responses: list[tuple[list[int], str]]):
         self._responses = list(responses)
         self._idx = 0
+        self.calls = []
 
-    def generate(self, token_ids, max_new, stop_token_ids, stop, seed):
+    def generate(self, token_ids, max_new, stop_token_ids, stop, seed, **kwargs):
         if self._idx >= len(self._responses):
             raise RuntimeError("MockBackend exhausted its responses")
+        self.calls.append({
+            "temperature": kwargs.get("temperature"),
+            "top_p": kwargs.get("top_p"),
+            "top_k": kwargs.get("top_k"),
+        })
         resp = self._responses[self._idx]
         self._idx += 1
         return resp
+
+
+class AsyncMockBackend:
+    """Async backend that returns responses from a request callback."""
+
+    def __init__(self, callback):
+        self.callback = callback
+        self.request_ids: list[str] = []
+        self.lora_requests: list[object | None] = []
+
+    async def generate_async(
+        self,
+        token_ids,
+        max_new,
+        stop_token_ids,
+        stop,
+        seed,
+        *,
+        request_id=None,
+        return_logprobs=False,
+        **kwargs,
+    ):
+        self.request_ids.append(request_id)
+        self.lora_requests.append(kwargs.get("lora_request"))
+        await asyncio.sleep(0.001 * (seed % 3))
+        out_tokens, finish = self.callback(request_id, seed)
+        logprobs = [-float(i + 1) for i in range(len(out_tokens))] if return_logprobs else None
+        return out_tokens, finish, logprobs
+
+    def abort_requests(self, request_ids):
+        pass
 
 
 class SimpleTokenizer:
@@ -175,6 +214,24 @@ def test_mask_pattern_prompt_gen_env(tokenizer, cfg):
             assert segment_mask.all(), f"gen turn ({start}:{end}) should be all mask=1"
         elif kind in ("prompt", "env"):
             assert not segment_mask.any(), f"{kind} turn ({start}:{end}) should be all mask=0"
+
+
+def test_rollout_forwards_sampling_config(tokenizer):
+    cfg = RolloutConfig(
+        max_turns=1,
+        max_tokens_per_turn=32,
+        max_total_tokens=100_000,
+        temperature=0.7,
+        top_p=0.91,
+        top_k=17,
+    )
+    final_ids = tokenizer.encode(_make_final_answer_text(), add_special_tokens=False)
+    backend = MockBackend([(final_ids, "eos")])
+
+    rollout = MultiTurnRollout(MockEnv(), QWEN3_5_SPEC, backend, tokenizer)
+    rollout.run(cfg, seed_env=0, seed_rollout=0, rollout_id=0)
+
+    assert backend.calls == [{"temperature": 0.7, "top_p": 0.91, "top_k": 17}]
 
 
 def test_tool_block_boundaries(tokenizer, cfg):
@@ -468,3 +525,255 @@ def test_two_turn_interaction(tokenizer, cfg):
     # Total trainable tokens = sum of gen turn lengths
     trainable = sum(end - start for start, end, kind in traj.turns if kind == "gen")
     assert traj.n_trainable == trainable
+
+
+def test_async_refill_single_turn_preserves_groups_and_logprobs(tokenizer):
+    cfg = RolloutConfig(
+        max_turns=1,
+        max_tokens_per_turn=10,
+        max_total_tokens=100_000,
+        async_refill=True,
+        async_max_inflight=2,
+    )
+    final_ids = tokenizer.encode(_make_final_answer_text(), add_special_tokens=False)
+
+    backend = AsyncMockBackend(lambda request_id, seed: (final_ids, "eos"))
+    rollout = MultiTurnRollout(
+        MockEnv(), QWEN3_5_SPEC, backend, tokenizer, env_factory=lambda: MockEnv()
+    )
+
+    groups = rollout.run_multi_group_refill(
+        cfg=cfg,
+        seed_envs=[10, 11],
+        seed_rollout=7,
+        group_size=2,
+    )
+
+    assert len(groups) == 2
+    assert all(len(group) == 2 for group in groups)
+    for group in groups:
+        for traj in group:
+            assert traj.reward == 0.5
+            assert traj.logp_old is not None
+            assert torch.allclose(
+                traj.logp_old[traj.mask],
+                torch.tensor([-float(i + 1) for i in range(traj.n_trainable)]),
+            )
+
+
+def test_async_refill_multi_turn_uses_isolated_envs(tokenizer):
+    cfg = RolloutConfig(
+        max_turns=2,
+        max_tokens_per_turn=4096,
+        max_total_tokens=100_000,
+        async_refill=True,
+        async_max_inflight=2,
+    )
+    tool_call_ids = tokenizer.encode(_make_tool_call_text(), add_special_tokens=False)
+    final_ids = tokenizer.encode(_make_final_answer_text(), add_special_tokens=False)
+
+    def callback(request_id, seed):
+        if "-t0-" in request_id:
+            return tool_call_ids, "stop"
+        return final_ids, "eos"
+
+    backend = AsyncMockBackend(callback)
+    rollout = MultiTurnRollout(
+        MockEnv(), QWEN3_5_SPEC, backend, tokenizer, env_factory=lambda: MockEnv()
+    )
+
+    groups = rollout.run_multi_group_refill(
+        cfg=cfg,
+        seed_envs=[20, 21],
+        seed_rollout=3,
+        group_size=1,
+    )
+
+    assert len(groups) == 2
+    for group in groups:
+        traj = group[0]
+        kinds = [kind for _, _, kind in traj.turns]
+        assert kinds.count("gen") == 2
+        assert "env" in kinds
+        assert traj.reward == 0.5
+
+
+def test_async_rollout_pool_returns_complete_policy_tagged_groups(tokenizer):
+    cfg = RolloutConfig(
+        max_turns=1,
+        max_tokens_per_turn=10,
+        max_total_tokens=100_000,
+        async_refill=True,
+        async_cross_step=True,
+        async_max_inflight=2,
+    )
+    final_ids = tokenizer.encode(_make_final_answer_text(), add_special_tokens=False)
+    backend = AsyncMockBackend(lambda request_id, seed: (final_ids, "eos"))
+    rollout = MultiTurnRollout(
+        MockEnv(), QWEN3_5_SPEC, backend, tokenizer, env_factory=lambda: MockEnv()
+    )
+    pool = AsyncRolloutPool(
+        rollout,
+        cfg,
+        seed_env_base=100,
+        seed_rollout=7,
+        group_size=2,
+        target_groups=2,
+        max_inflight_requests=2,
+        max_off_policy_steps=1,
+        drop_stale=True,
+    )
+    pool.start(policy_version=0)
+    try:
+        groups, metrics = pool.get_completed_groups(1, current_policy_version=0)
+    finally:
+        pool.close()
+
+    assert metrics.consumed_groups == 1
+    assert len(groups) == 1
+    assert len(groups[0].trajectories) == 2
+    assert groups[0].policy_version == 0
+    assert groups[0].trajectories[0].meta["policy_version"] == 0
+    assert groups[0].trajectories[0].logp_old is not None
+
+
+def test_async_rollout_pool_supports_multi_turn_groups(tokenizer):
+    cfg = RolloutConfig(
+        max_turns=2,
+        max_tokens_per_turn=4096,
+        max_total_tokens=100_000,
+        async_refill=True,
+        async_cross_step=True,
+        async_max_inflight=2,
+    )
+    tool_call_ids = tokenizer.encode(_make_tool_call_text(), add_special_tokens=False)
+    final_ids = tokenizer.encode(_make_final_answer_text(), add_special_tokens=False)
+
+    def callback(request_id, seed):
+        if "-t0-" in request_id:
+            return tool_call_ids, "stop"
+        return final_ids, "eos"
+
+    backend = AsyncMockBackend(callback)
+    rollout = MultiTurnRollout(
+        MockEnv(), QWEN3_5_SPEC, backend, tokenizer, env_factory=lambda: MockEnv()
+    )
+    pool = AsyncRolloutPool(
+        rollout,
+        cfg,
+        seed_env_base=300,
+        seed_rollout=7,
+        group_size=2,
+        target_groups=1,
+        max_inflight_requests=2,
+        max_off_policy_steps=1,
+        drop_stale=True,
+    )
+    pool.start(policy_version=0)
+    try:
+        groups, metrics = pool.get_completed_groups(1, current_policy_version=0)
+    finally:
+        pool.close()
+
+    assert metrics.consumed_groups == 1
+    assert len(groups) == 1
+    assert len(groups[0].trajectories) == 2
+    for traj in groups[0].trajectories:
+        kinds = [kind for _, _, kind in traj.turns]
+        assert kinds.count("gen") == 2
+        assert "env" in kinds
+        assert traj.logp_old is not None
+
+
+def test_async_rollout_pool_drops_too_stale_groups(tokenizer):
+    cfg = RolloutConfig(
+        max_turns=1,
+        max_tokens_per_turn=10,
+        max_total_tokens=100_000,
+        async_refill=True,
+        async_cross_step=True,
+        async_max_inflight=4,
+    )
+    final_ids = tokenizer.encode(_make_final_answer_text(), add_special_tokens=False)
+    backend = AsyncMockBackend(lambda request_id, seed: (final_ids, "eos"))
+    rollout = MultiTurnRollout(
+        MockEnv(), QWEN3_5_SPEC, backend, tokenizer, env_factory=lambda: MockEnv()
+    )
+    pool = AsyncRolloutPool(
+        rollout,
+        cfg,
+        seed_env_base=200,
+        seed_rollout=7,
+        group_size=1,
+        target_groups=2,
+        max_inflight_requests=2,
+        max_off_policy_steps=0,
+        drop_stale=True,
+    )
+    pool.start(policy_version=0)
+    try:
+        # Let policy-0 groups complete, then force new groups to policy 1.
+        first, _ = pool.get_completed_groups(1, current_policy_version=0)
+        assert first[0].policy_version == 0
+        pool.update_policy_version(1)
+        groups, metrics = pool.get_completed_groups(1, current_policy_version=1)
+    finally:
+        pool.close()
+
+    assert groups[0].policy_version == 1
+    assert metrics.dropped_stale_groups >= 0
+
+
+def test_async_active_state_pins_lora_request_across_turns(tokenizer):
+    cfg = RolloutConfig(
+        max_turns=2,
+        max_tokens_per_turn=4096,
+        max_total_tokens=100_000,
+        async_refill=True,
+        async_cross_step=True,
+        async_max_inflight=1,
+    )
+    tool_call_ids = tokenizer.encode(_make_tool_call_text(), add_special_tokens=False)
+    final_ids = tokenizer.encode(_make_final_answer_text(), add_special_tokens=False)
+
+    class PinningBackend(AsyncMockBackend):
+        def __init__(self):
+            super().__init__(self.callback_with_lora_swap)
+            self.current_lora = object()
+            self.initial_lora = self.current_lora
+            self.swapped = False
+
+        def current_lora_request(self):
+            return self.current_lora
+
+        def callback_with_lora_swap(self, request_id, seed):
+            if not self.swapped:
+                self.current_lora = object()
+                self.swapped = True
+                return tool_call_ids, "stop"
+            return final_ids, "eos"
+
+    backend = PinningBackend()
+    rollout = MultiTurnRollout(
+        MockEnv(), QWEN3_5_SPEC, backend, tokenizer, env_factory=lambda: MockEnv()
+    )
+    pool = AsyncRolloutPool(
+        rollout,
+        cfg,
+        seed_env_base=400,
+        seed_rollout=7,
+        group_size=1,
+        target_groups=1,
+        max_inflight_requests=1,
+        max_off_policy_steps=1,
+        drop_stale=True,
+    )
+    pool.start(policy_version=0)
+    try:
+        groups, _ = pool.get_completed_groups(1, current_policy_version=0)
+    finally:
+        pool.close()
+
+    assert len(groups) == 1
+    assert len(backend.lora_requests) == 2
+    assert backend.lora_requests == [backend.initial_lora, backend.initial_lora]

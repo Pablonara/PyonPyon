@@ -18,30 +18,36 @@ class HFBackend:
         stop_token_ids: list[int],
         stop: list[str],
         seed: int,
+        *,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
     ) -> tuple[list[int], str]:
         device = next(self.model.parameters()).device
         input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
 
-        cpu_state = torch.random.get_rng_state()
-        cuda_state = torch.cuda.get_rng_state(device) if device.type == "cuda" else None
         torch.manual_seed(seed)
-        if cuda_state is not None:
+        if torch.cuda.is_available():
             torch.cuda.manual_seed(seed)
 
-        out = self.model.generate(
-            input_ids=input_ids,
-            max_new_tokens=max_new,
-            do_sample=True,
-            temperature=1.0,
-            top_p=1.0,
-            eos_token_id=stop_token_ids,
-            pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
-            return_dict_in_generate=True,
-        )
+        temperature = 1.0 if temperature is None else temperature
+        top_p = 0.95 if top_p is None else top_p
+        gen_kwargs = {
+            "input_ids": input_ids,
+            "max_new_tokens": max_new,
+            "do_sample": temperature > 0,
+            "eos_token_id": stop_token_ids,
+            "pad_token_id": self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+            "return_dict_in_generate": True,
+        }
+        if temperature > 0:
+            gen_kwargs.update(
+                temperature=temperature,
+                top_p=top_p,
+                top_k=0 if top_k is None else top_k,
+            )
 
-        torch.random.set_rng_state(cpu_state)
-        if cuda_state is not None:
-            torch.cuda.set_rng_state(cuda_state, device)
+        out = self.model.generate(**gen_kwargs)
 
         full_seq = out.sequences[0]
         gen_ids = full_seq[len(token_ids):].tolist()

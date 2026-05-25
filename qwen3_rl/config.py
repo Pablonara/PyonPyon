@@ -20,11 +20,40 @@ class RolloutConfig:
     mamba_cache_mode: Literal["align", "all"] = "align"
     enforce_eager: bool = False
     batch_across_groups: bool = True
+    async_refill: bool = False
+    async_max_inflight: int | None = None
+    async_rollout_groups: int | None = None
+    async_cross_step: bool = False
+    async_pool_target_groups: int | None = None
+    async_max_off_policy_steps: int = 16
+    async_drop_stale: bool = True
+    max_loaded_loras: int | None = None
     max_turns: int = 8
     max_tokens_per_turn: int = 4096
     max_total_tokens: int = 48_000
     temperature: float = 1.0
-    top_p: float = 1.0
+    top_p: float = 0.95
+    top_k: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.async_cross_step:
+            self.async_refill = True
+        if self.async_max_inflight is not None and self.async_max_inflight < 1:
+            raise ValueError("async_max_inflight must be >= 1")
+        if self.async_rollout_groups is not None and self.async_rollout_groups < 1:
+            raise ValueError("async_rollout_groups must be >= 1")
+        if self.async_pool_target_groups is not None and self.async_pool_target_groups < 1:
+            raise ValueError("async_pool_target_groups must be >= 1")
+        if self.async_max_off_policy_steps < 0:
+            raise ValueError("async_max_off_policy_steps must be >= 0")
+        if self.max_loaded_loras is not None and self.max_loaded_loras < 1:
+            raise ValueError("max_loaded_loras must be >= 1")
+        if self.temperature < 0:
+            raise ValueError("temperature must be >= 0")
+        if not 0 < self.top_p <= 1:
+            raise ValueError("top_p must be in (0, 1]")
+        if self.top_k is not None and self.top_k < 1:
+            raise ValueError("top_k must be >= 1 when set")
 
 
 @dataclass
@@ -61,11 +90,22 @@ class RunConfig:
     save_every: int = 50
     eval_every: int = 25
     eval_subset_size: int = 32
-    resume_from_checkpoint: str | None = None
-    seed_torch: int = 42
-    seed_rollout: int = 42
-    seed_env: int = 42
+    eval_temperature: float = 0.6
+    eval_top_p: float = 0.95
+    eval_top_k: int | None = 20
     rollout_trace_dir: str | None = None
     rollout_trace_every: int = 1
     rollout_trace_max_per_iter: int = 8
     rollout_trace_queue_size: int = 1024
+    resume_from_checkpoint: str | None = None
+    seed_torch: int = 42
+    seed_rollout: int = 42
+    seed_env: int = 42
+
+    def __post_init__(self) -> None:
+        if self.eval_temperature < 0:
+            raise ValueError("eval_temperature must be >= 0")
+        if not 0 < self.eval_top_p <= 1:
+            raise ValueError("eval_top_p must be in (0, 1]")
+        if self.eval_top_k is not None and self.eval_top_k < 1:
+            raise ValueError("eval_top_k must be >= 1 when set")

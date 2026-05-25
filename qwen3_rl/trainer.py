@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import os
 import time
-import warnings
+import dataclasses
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import torch
 
 from .loss.fused_logp import compute_per_token_logp, _chunked_logp
 from .loss.grpo import compute_group_advantages, grpo_loss
+from .rollout.async_pool import AsyncRolloutPool, RolloutPoolMetrics
 from .rollout.base import MultiTurnRollout
 from .rollout.hf_backend import HFBackend
 from .trace import RolloutTraceRecorder
@@ -28,10 +29,10 @@ def _adapter_disabled(model):
             yield
         return
 
+    import warnings
     warnings.warn(
         "model.disable_adapter() not available, zeroing LoRA scalings manually",
-        RuntimeWarning,
-        stacklevel=2,
+        RuntimeWarning, stacklevel=2,
     )
     scalings = {}
     for name, module in model.named_modules():
@@ -76,6 +77,7 @@ class MultiTurnGRPOTrainer:
         template: TemplateSpec,
         config: RunConfig,
         backend=None,
+        env_factory: Callable[[], Env] | None = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -88,12 +90,24 @@ class MultiTurnGRPOTrainer:
             self.backend = backend
         else:
             self.backend = HFBackend(model, tokenizer)
-        self.rollout = MultiTurnRollout(env, template, self.backend, tokenizer)
+        self.rollout = MultiTurnRollout(
+            env, template, self.backend, tokenizer, env_factory=env_factory,
+        )
 
         # Eval uses the same backend as rollout (vLLM when available)
-        self._eval_rollout = MultiTurnRollout(env, template, self.backend, tokenizer)
+        self._eval_rollout = MultiTurnRollout(
+            env, template, self.backend, tokenizer, env_factory=env_factory,
+        )
 
         self._is_vllm = hasattr(self.backend, "generate_batch")
+        self._async_pool: AsyncRolloutPool | None = None
+        self.trace_recorder = RolloutTraceRecorder(
+            config.rollout_trace_dir,
+            tokenizer,
+            template,
+            run_id=f"seed{config.seed_torch}_{int(time.time())}",
+            max_queue=config.rollout_trace_queue_size,
+        )
 
         self.optimizer = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad],
@@ -111,38 +125,6 @@ class MultiTurnGRPOTrainer:
             )
         else:
             self.scheduler = None
-
-        self.trace_recorder = RolloutTraceRecorder(
-            config.rollout_trace_dir,
-            tokenizer,
-            template,
-            run_id=f"seed{config.seed_torch}_{int(time.time())}",
-            max_queue=config.rollout_trace_queue_size,
-        )
-
-    @torch.no_grad()
-    def _eval(self, n_problems: int = 32) -> float:
-        self.model.eval()
-        cfg = self.config.rollout
-
-        if self._is_vllm and cfg.max_turns == 1:
-            seed_envs = [100000 + i for i in range(n_problems)]
-            groups = self._eval_rollout.run_multi_group_batch(
-                cfg=cfg,
-                seed_envs=seed_envs,
-                seed_rollout=99999,
-                group_size=1,
-            )
-            correct = sum(g[0].reward for g in groups)
-        else:
-            correct = 0
-            for i in range(n_problems):
-                traj = self._eval_rollout.run(
-                    cfg=cfg, seed_env=100000 + i,
-                    seed_rollout=99999, rollout_id=0,
-                )
-                correct += traj.reward
-        return correct / n_problems
 
     def _record_rollout_trace(
         self,
@@ -170,6 +152,35 @@ class MultiTurnGRPOTrainer:
             seed_rollout=cfg.seed_rollout + rollout_id * cfg.rollout.max_turns,
         )
 
+    @torch.no_grad()
+    def _eval(self, n_problems: int = 32) -> float:
+        self.model.eval()
+        cfg = dataclasses.replace(
+            self.config.rollout,
+            temperature=self.config.eval_temperature,
+            top_p=self.config.eval_top_p,
+            top_k=self.config.eval_top_k,
+        )
+
+        if self._is_vllm and cfg.max_turns == 1:
+            seed_envs = [100000 + i for i in range(n_problems)]
+            groups = self._eval_rollout.run_multi_group_batch(
+                cfg=cfg,
+                seed_envs=seed_envs,
+                seed_rollout=99999,
+                group_size=1,
+            )
+            correct = sum(g[0].reward for g in groups)
+        else:
+            correct = 0
+            for i in range(n_problems):
+                traj = self._eval_rollout.run(
+                    cfg=cfg, seed_env=100000 + i,
+                    seed_rollout=99999, rollout_id=0,
+                )
+                correct += traj.reward
+        return correct / n_problems
+
     def train(self, num_iterations: int):
         cfg = self.config
         G = cfg.grpo.group_size
@@ -183,9 +194,28 @@ class MultiTurnGRPOTrainer:
         degenerate_count = 0
         reward_history: list[float] = []
         adapter_saved = False
+        policy_version = 0
 
         eval_acc = self._eval(n_problems=cfg.eval_subset_size)
         print(f"[eval  init] accuracy={eval_acc:.3f} ({cfg.eval_subset_size} problems)")
+
+        if cfg.rollout.async_cross_step:
+            if not self._is_vllm:
+                raise ValueError("async_cross_step requires the vLLM backend")
+            target_groups = cfg.rollout.async_pool_target_groups or max(M * 4, M + 1)
+            max_inflight = cfg.rollout.async_max_inflight or (M * G)
+            self._async_pool = AsyncRolloutPool(
+                self.rollout,
+                cfg.rollout,
+                seed_env_base=cfg.seed_env,
+                seed_rollout=cfg.seed_rollout,
+                group_size=G,
+                target_groups=target_groups,
+                max_inflight_requests=max_inflight,
+                max_off_policy_steps=cfg.rollout.async_max_off_policy_steps,
+                drop_stale=cfg.rollout.async_drop_stale,
+            )
+            self._async_pool.start(policy_version=policy_version)
 
         for iter_id in range(num_iterations):
             t0 = time.time()
@@ -194,15 +224,33 @@ class MultiTurnGRPOTrainer:
             if self._is_vllm:
                 if cfg.rollout.sleep_between_iters:
                     self.backend.wake()
-                if iter_id > 0 and adapter_saved:
+                if (
+                    iter_id > 0 and adapter_saved
+                    and not cfg.rollout.async_cross_step
+                ):
                     self.backend.sync_adapter(adapter_path, iter_id)
 
             self.model.eval()
             all_trajs: list[Trajectory] = []
+            pool_metrics = RolloutPoolMetrics()
 
             seed_envs = [cfg.seed_env + iter_id * M + g for g in range(M)]
 
-            if self._is_vllm and cfg.rollout.max_turns == 1 and cfg.rollout.batch_across_groups:
+            if cfg.rollout.async_cross_step:
+                assert self._async_pool is not None
+                pool_groups, pool_metrics = self._async_pool.get_completed_groups(
+                    M, current_policy_version=policy_version,
+                )
+                all_groups = [group.trajectories for group in pool_groups]
+                seed_envs = [group.seed_env for group in pool_groups]
+            elif self._is_vllm and cfg.rollout.async_refill:
+                all_groups = self.rollout.run_multi_group_refill(
+                    cfg=cfg.rollout,
+                    seed_envs=seed_envs,
+                    seed_rollout=cfg.seed_rollout,
+                    group_size=G,
+                )
+            elif self._is_vllm and cfg.rollout.max_turns == 1 and cfg.rollout.batch_across_groups:
                 all_groups = self.rollout.run_multi_group_batch(
                     cfg=cfg.rollout,
                     seed_envs=seed_envs,
@@ -252,8 +300,8 @@ class MultiTurnGRPOTrainer:
                             f"[iter {iter_id:4d}] degenerate group "
                             f"(all rewards={rewards[0]:.3f}), skipping"
                         )
-                    trace_trajs = []
                 else:
+                    trace_trajs = []
                     for traj, adv in zip(group_trajs, advantages):
                         traj = traj.replace(advantage=adv)
                         all_trajs.append(traj)
@@ -349,6 +397,11 @@ class MultiTurnGRPOTrainer:
                     self.model.save_pretrained(adapter_path)
                     self.tokenizer.save_pretrained(adapter_path)
                     adapter_saved = True
+                    if cfg.rollout.async_cross_step:
+                        policy_version += 1
+                        self.backend.sync_adapter(adapter_path, policy_version)
+                        assert self._async_pool is not None
+                        self._async_pool.update_policy_version(policy_version)
 
             elapsed = time.time() - t0
 
@@ -375,6 +428,18 @@ class MultiTurnGRPOTrainer:
                     f"n={len(enriched)}  "
                     f"t={elapsed:.1f}s "
                     f"(roll={t_rollout:.1f} logp={t_logp:.1f} train={t_train:.1f})"
+                    + (
+                        " "
+                        f"pool_wait={pool_metrics.wait_s:.1f}s "
+                        f"stale={pool_metrics.mean_staleness:.2f}/"
+                        f"{pool_metrics.max_staleness} "
+                        f"drop={pool_metrics.dropped_stale_groups} "
+                        f"drop_active={pool_metrics.dropped_active_stale_groups} "
+                        f"pool_done={pool_metrics.completed_groups} "
+                        f"pool_active={pool_metrics.active_groups} "
+                        f"inflight={pool_metrics.inflight_requests}"
+                        if cfg.rollout.async_cross_step else ""
+                    )
                 )
             elif cfg.log_every and iter_id % cfg.log_every == 0:
                 rewards_iter = [
@@ -406,9 +471,13 @@ class MultiTurnGRPOTrainer:
                 self.tokenizer.save_pretrained(save_path)
                 print(f"  -> saved to {save_path}")
 
-        print(f"\nDone. {degenerate_count} degenerate groups skipped.")
         self.trace_recorder.close()
+        if self._async_pool is not None:
+            self._async_pool.close()
+        if hasattr(self.backend, "close"):
+            self.backend.close()
         if self.trace_recorder.dropped:
             print(f"Rollout trace recorder dropped {self.trace_recorder.dropped} item(s).")
         if self.trace_recorder.errors:
             print(f"Rollout trace recorder failed to write {self.trace_recorder.errors} item(s).")
+        print(f"\nDone. {degenerate_count} degenerate groups skipped.")
