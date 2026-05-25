@@ -57,6 +57,13 @@ def normalize_messages(messages: Any) -> list[dict[str, Any]]:
         if not isinstance(message, dict):
             raise ValueError(f"messages[{idx}] must be an object, got {type(message).__name__}")
 
+        if message.get("role") == "assistant" and not message.get("reasoning_content"):
+            for key in ("thought", "reasoning", "reasoning_content"):
+                value = message.get(key)
+                if isinstance(value, str) and value.strip():
+                    message["reasoning_content"] = value
+                    break
+
         for tool_call in message.get("tool_calls") or []:
             function = tool_call.get("function") if isinstance(tool_call, dict) else None
             if not isinstance(function, dict):

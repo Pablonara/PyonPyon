@@ -39,6 +39,7 @@ def test_normalize_messages_parses_tool_arguments():
     messages = [{
         "role": "assistant",
         "content": "thinking",
+        "thought": "hidden reasoning",
         "tool_calls": [{
             "function": {
                 "name": "bash",
@@ -52,6 +53,7 @@ def test_normalize_messages_parses_tool_arguments():
     assert normalized[0]["tool_calls"][0]["function"]["arguments"] == {
         "command": "pytest"
     }
+    assert normalized[0]["reasoning_content"] == "hidden reasoning"
     assert messages[0]["tool_calls"][0]["function"]["arguments"] == "{\"command\": \"pytest\"}"
 
 

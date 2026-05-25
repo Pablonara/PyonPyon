@@ -50,6 +50,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default="./sft_output")
     parser.add_argument("--prepared-output-dir", default=None,
                         help="Optional save_to_disk path for prepared text dataset")
+    parser.add_argument("--prepared-dataset", default=None,
+                        help="Load a previously save_to_disk prepared text dataset")
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--max-examples", type=int, default=None)
     parser.add_argument("--min-reward", type=float, default=None,
@@ -74,6 +76,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-packing", action="store_true")
     parser.add_argument("--no-response-mask", action="store_true",
                         help="Train on every token instead of assistant responses only")
+    parser.add_argument("--report-to", default="none",
+                        help="Trainer reporting target, e.g. none or wandb")
+    parser.add_argument("--run-name", default=None,
+                        help="Optional run name for W&B / Trainer logs")
+    parser.add_argument("--wandb-project", default=None,
+                        help="Set WANDB_PROJECT for this run")
+    parser.add_argument("--push-to-hub", action="store_true",
+                        help="Upload the final adapter to the Hugging Face Hub")
+    parser.add_argument("--hub-model-id", default=None,
+                        help="Hugging Face repo id for --push-to-hub")
+    parser.add_argument("--hub-private", action="store_true",
+                        help="Create/upload to a private Hugging Face repo")
     parser.add_argument("--no-compile-warmup", action="store_true")
     return parser
 
@@ -89,6 +103,19 @@ def _load_prepare_tokenizer(args):
 
 
 def _prepare_dataset(args, tokenizer):
+    if args.prepared_dataset:
+        from datasets import load_from_disk
+
+        dataset = load_from_disk(args.prepared_dataset)
+        stats = token_length_stats(dataset["text"], tokenizer)
+        print(
+            "[sft:data] "
+            f"loaded={args.prepared_dataset} rows={stats['count']} "
+            f"tok_min={stats['min']} tok_median={stats['median']} "
+            f"tok_max={stats['max']}"
+        )
+        return dataset, stats
+
     records = jsonl_to_text_records(
         args.data,
         tokenizer=tokenizer,
@@ -111,6 +138,8 @@ def _prepare_dataset(args, tokenizer):
 
 def main() -> None:
     args = _build_arg_parser().parse_args()
+    if args.wandb_project:
+        os.environ["WANDB_PROJECT"] = args.wandb_project
 
     if args.prepare_only:
         tokenizer = _load_prepare_tokenizer(args)
@@ -185,7 +214,11 @@ def main() -> None:
         dataset_text_field="text",
         packing=not args.no_packing,
         seed=args.seed,
-        report_to="none",
+        report_to=args.report_to,
+        run_name=args.run_name,
+        push_to_hub=args.push_to_hub,
+        hub_model_id=args.hub_model_id,
+        hub_private_repo=args.hub_private,
     )
 
     trainer = SFTTrainer(
@@ -210,6 +243,9 @@ def main() -> None:
     trainer.save_model(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
     print(f"[sft] saved to {args.output_dir}")
+    if args.push_to_hub:
+        trainer.push_to_hub()
+        print(f"[sft] pushed to hub: {args.hub_model_id or args.output_dir}")
 
 
 if __name__ == "__main__":
